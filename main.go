@@ -31,6 +31,26 @@ type IpAuthConfig struct {
 	UsePolicyUrl         bool   `yaml:"usePolicyUrl"`
 }
 
+type Policy struct {
+	Id            string
+	ProjectID     string
+	VersionID     string
+	PolicyVersion string
+	Type          string
+	Entries       []PolicyEntry
+}
+
+type PolicyEntry struct {
+	Target string
+	Tags   []PolicyTag
+	Policy string
+}
+
+type PolicyTag struct {
+	Name   string
+	Values []string
+}
+
 const denyBody = "denied by ip-auth"
 
 var (
@@ -42,48 +62,92 @@ var (
 type ExtAuthzServer struct {
 	httpServer *http.Server
 	// For test only
-	httpPort chan int
-	config   IpAuthConfig
-	block    []netip.Prefix
+	httpPort  chan int
+	config    IpAuthConfig
+	allowlist []netip.Prefix
+	blocklist []netip.Prefix
+	etag      string
 }
 
-func (s *ExtAuthzServer) isBlocked(extIp string) bool {
+func (s *ExtAuthzServer) isAllowed(extIp string) bool {
 	ip, err := netip.ParseAddr(extIp)
 	if err != nil {
-		log.Fatalf("Failed to parse IP: %v", err)
+		log.Printf("Failed to parse IP: %v", err)
+		return false
 	}
-	for _, p := range s.block {
+	// allow list takes precedence over the block list
+	for _, p := range s.allowlist {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	for _, p := range s.blocklist {
 		if p.Contains(ip) {
 			return false
 		}
 	}
+	// if there are no rules then allow
 	return true
 }
 
 func (s *ExtAuthzServer) refreshPolicies(interval int) {
 	if s.config.UsePolicyFile {
-		s.readPolicyFile(*policyFile)
+		err := s.readPolicyFile(*policyFile)
+		if err != nil {
+			log.Printf("Error during policy read: %v", err)
+		}
 	}
 	if s.config.UsePolicyUrl {
-		s.fetchPolicies()
+		err := s.fetchPolicies()
+		if err != nil {
+			log.Printf("Error during policy fetch: %v", err)
+		}
 	}
 	if interval > 0 {
 		log.Printf("Refreshing policies every %v seconds", interval)
 		for range time.Tick(time.Duration(interval) * time.Second) {
 			if s.config.UsePolicyFile {
-				s.readPolicyFile(*policyFile)
+				err := s.readPolicyFile(*policyFile)
+				if err != nil {
+					log.Printf("Error during policy read: %v", err)
+				}
 			}
 			if s.config.UsePolicyUrl {
-				s.fetchPolicies()
+				err := s.fetchPolicies()
+				if err != nil {
+					log.Printf("Error during policy fetch: %v", err)
+				}
 			}
 		}
 	} else {
 		log.Printf("Policy refresh is disabled")
 	}
-
 }
 
-func (s *ExtAuthzServer) fetchPolicies() {
+func (s *ExtAuthzServer) applyPolicies(policies []Policy) {
+	var allowlist, blocklist []netip.Prefix
+	for _, policy := range policies {
+		log.Printf("Applying policy ID %v, version %v, project %v", policy.Id, policy.PolicyVersion, policy.ProjectID)
+		for _, policyEntry := range policy.Entries {
+			p, err := netip.ParsePrefix(policyEntry.Target)
+			if err != nil {
+				log.Printf("Failed to parse network: %v", err)
+			}
+			if policyEntry.Policy == "BLOCK" {
+				blocklist = append(blocklist, p)
+			} else if policyEntry.Policy == "ALLOW" {
+				allowlist = append(allowlist, p)
+			} else {
+				log.Printf("Unknown policy %v for target %v, ignoring", policyEntry.Policy, policyEntry.Target)
+			}
+		}
+	}
+	s.allowlist = allowlist
+	s.blocklist = blocklist
+	log.Printf("Number of network ranges: allowed: %v, blocked: %v", len(s.allowlist), len(s.blocklist))
+}
+
+func (s *ExtAuthzServer) fetchPolicies() error {
 	log.Printf("Fetching policies from %s", s.config.PolicyURL)
 	cfg := clientcredentials.Config{
 		ClientID:     s.config.ClientId,
@@ -91,34 +155,38 @@ func (s *ExtAuthzServer) fetchPolicies() {
 		TokenURL:     s.config.TokenURL,
 	}
 	client := cfg.Client(context.Background())
-	res, err := client.Get(s.config.PolicyURL)
-	if err != nil {
-		log.Fatalf("Failed to get policies: %v", err)
-	}
-	resBody, err := io.ReadAll(res.Body)
-	defer res.Body.Close()
-	if err != nil {
-		log.Fatalf("Failed to read response body: %v", err)
-	}
-	policies := []map[string]string{}
-	err = json.Unmarshal(resBody, &policies)
-	if err != nil {
-		log.Fatalf("Failed to parse policies: %v", err)
-	}
-	var block []netip.Prefix
 
-	for _, policy := range policies {
-		if policy["policy"] == "BLOCK_ACCESS" {
-			p, err := netip.ParsePrefix(policy["network"])
-			if err != nil {
-				log.Fatalf("Failed to parse network: %v", err)
-			}
-			block = append(block, p)
+	req, _ := http.NewRequest("GET", s.config.PolicyURL, nil)
+	if s.etag != "" {
+		req.Header.Set("if-none-match", s.etag)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get policies: %w", err)
+	} else if res.StatusCode == 304 {
+		log.Printf("Policy with etag %v is already applied", s.etag)
+		return nil
+	} else if res.StatusCode == 200 {
+		etag := res.Header.Get("etag")
+		log.Printf("Received policy list with etag: %v", etag)
+
+		resBody, err := io.ReadAll(res.Body)
+		defer res.Body.Close()
+		if err != nil {
+			return fmt.Errorf("failed to read response body: %w", err)
 		}
+		var policies []Policy
+		err = json.Unmarshal(resBody, &policies)
+		if err != nil {
+			return fmt.Errorf("failed to parse policies: %w", err)
+		} else {
+			s.applyPolicies(policies)
+			s.etag = etag
+			return nil
+		}
+	} else {
+		return fmt.Errorf("failed to get policies, status code: %v", res.StatusCode)
 	}
-	s.block = block
-	log.Printf("Number of blocked network ranges: %v", len(s.block))
-
 }
 
 // ServeHTTP implements the HTTP check request.
@@ -129,8 +197,7 @@ func (s *ExtAuthzServer) ServeHTTP(response http.ResponseWriter, request *http.R
 	}
 	extIp := request.Header.Get("x-envoy-external-address")
 	l := fmt.Sprintf("%s %s%s, ip: %v\n", request.Method, request.Host, request.URL, extIp)
-	log.Printf("External IP: %s", extIp)
-	if s.isBlocked(extIp) {
+	if s.isAllowed(extIp) {
 		log.Printf("[HTTP][allowed]: %s", l)
 		response.WriteHeader(http.StatusOK)
 	} else {
@@ -171,39 +238,31 @@ func (s *ExtAuthzServer) stop() {
 	log.Printf("HTTP server stopped: %v", s.httpServer.Close())
 }
 
-func NewExtAuthzServer(config IpAuthConfig, block []netip.Prefix) *ExtAuthzServer {
+func NewExtAuthzServer(config IpAuthConfig, allow []netip.Prefix, block []netip.Prefix) *ExtAuthzServer {
 	return &ExtAuthzServer{
-		httpPort: make(chan int, 1),
-		config:   config,
-		block:    block,
+		httpPort:  make(chan int, 1),
+		config:    config,
+		allowlist: allow,
+		blocklist: block,
 	}
 }
 
-func (s *ExtAuthzServer) readPolicyFile(policyFile string) {
+func (s *ExtAuthzServer) readPolicyFile(policyFile string) error {
 	log.Printf("Reading policies from %s", policyFile)
-	policies := []map[string]string{}
+
 	policiesJson, err := os.ReadFile(policyFile)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
+	var policies []Policy
 	err = json.Unmarshal(policiesJson, &policies)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	var block []netip.Prefix
 
-	for _, policy := range policies {
-		if policy["policy"] == "BLOCK_ACCESS" {
-			p, err := netip.ParsePrefix(policy["network"])
-			if err != nil {
-				log.Fatalf("Failed to parse network: %v", err)
-			}
-			block = append(block, p)
-		}
-	}
-	s.block = block
-	log.Printf("Number of blocked network ranges: %v", len(s.block))
+	s.applyPolicies(policies)
+	return nil
 }
 
 func readConfigFile(configFile string, config *IpAuthConfig) {
@@ -222,13 +281,13 @@ func main() {
 	flag.Parse()
 
 	config := IpAuthConfig{UsePolicyFile: true, UsePolicyUrl: false, PolicyUpdateInterval: 600}
-	var block []netip.Prefix
+	var allow, block []netip.Prefix
 
 	if *configFile != "" {
 		readConfigFile(*configFile, &config)
 	}
 
-	s := NewExtAuthzServer(config, block)
+	s := NewExtAuthzServer(config, allow, block)
 
 	go s.refreshPolicies(config.PolicyUpdateInterval)
 
